@@ -1,6 +1,5 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    to_timestamp,
     col,
     count,
     when,
@@ -9,6 +8,17 @@ from pyspark.sql.functions import (
     avg,
     max,
     date_trunc,
+    to_timestamp,
+    date_format,
+    year,
+    month,
+    dayofweek,
+    dayofmonth,
+    dayofyear,
+    weekofyear,
+    quarter,
+    current_timestamp,
+    to_date,
 )
 
 
@@ -39,16 +49,16 @@ def ingest_data(
 
 
 def process_data(spark, bronze_path, silver_path, gold_path):
-    """Clean data and create silver and gold layers"""
+    """Clean data and create silver and gold layers matching the star schema"""
     # Read from bronze
     df = spark.read.parquet(bronze_path)
 
-    # Clean data
+    # Clean data for silver layer
     cleaned_df = (
         df.dropna(subset=["InvoiceNo", "StockCode", "CustomerID"])
         .fillna({"Description": "NO DESCRIPTION", "Quantity": 0, "UnitPrice": 0})
         .dropDuplicates(["InvoiceNo", "StockCode"])
-        .withColumn("InvoiceDate", to_timestamp("InvoiceDate", "dd-MM-yyyy HH:mm"))
+        .withColumn("InvoiceDate", to_timestamp("InvoiceDate", "dd/MM/yyyy HH:mm"))
         .withColumn("Quantity", col("Quantity").cast("integer"))
         .withColumn("UnitPrice", col("UnitPrice").cast("double"))
         .withColumn("TotalAmount", col("Quantity") * col("UnitPrice"))
@@ -60,28 +70,86 @@ def process_data(spark, bronze_path, silver_path, gold_path):
     cleaned_df.write.mode("overwrite").parquet(silver_path)
     print("Silver layer created successfully")
 
-    # Create gold tables
-    sales_summary = cleaned_df.groupBy(
-        "Country", date_trunc("month", "InvoiceDate").alias("Month")
-    ).agg(
-        countDistinct("InvoiceNo").alias("TotalOrders"),
-        sum("TotalAmount").alias("Revenue"),
-        avg("TotalAmount").alias("AverageOrderValue"),
+    # Create dimension tables for gold layer
+
+    # 1. Customer Dimension
+    dim_customer = (
+        cleaned_df.select("CustomerID", "Country")
+        .distinct()
+        .withColumn("created_date", current_timestamp())
     )
 
-    customer_metrics = cleaned_df.groupBy("CustomerID", "Country").agg(
-        count("InvoiceNo").alias("PurchaseFrequency"),
-        sum("TotalAmount").alias("TotalSpend"),
-        avg("TotalAmount").alias("AvgOrderValue"),
-        max("InvoiceDate").alias("LastPurchaseDate"),
+    # 2. Product Dimension
+    dim_product = (
+        cleaned_df.select(
+            col("StockCode").alias("stock_code"),
+            col("Description").alias("description"),
+            col("UnitPrice").alias("unit_price"),
+        )
+        .distinct()
+        .withColumn("created_date", current_timestamp())
+    )
+
+    # 3. Date Dimension
+    date_df = (
+        cleaned_df.select(to_date("InvoiceDate").alias("full_date"))
+        .distinct()
+        .withColumn("date_id", date_format("full_date", "yyyyMMdd").cast("int"))
+        .withColumn("day_of_week", dayofweek("full_date"))
+        .withColumn("day_name", date_format("full_date", "EEEE"))
+        .withColumn("day_of_month", dayofmonth("full_date"))
+        .withColumn("day_of_year", dayofyear("full_date"))
+        .withColumn("week_of_year", weekofyear("full_date"))
+        .withColumn("month", month("full_date"))
+        .withColumn("month_name", date_format("full_date", "MMMM"))
+        .withColumn("quarter", quarter("full_date"))
+        .withColumn("year", year("full_date"))
+        .withColumn("created_date", current_timestamp())
+    )
+
+    # 4. Invoice Dimension
+    dim_invoice = (
+        cleaned_df.select(col("InvoiceNo").alias("invoice_id"))
+        .distinct()
+        .withColumn(
+            "invoice_type",
+            when(col("invoice_id").startswith("C"), "Return").otherwise("Regular"),
+        )
+        .withColumn("created_date", current_timestamp())
+    )
+
+    # 5. Fact Sales
+    fact_sales = cleaned_df.join(
+        date_df.select("date_id", "full_date"),
+        to_date(cleaned_df.InvoiceDate) == date_df.full_date,
+    ).select(
+        col("InvoiceNo").alias("invoice_id"),
+        col("CustomerID").alias("customer_id"),
+        col("StockCode").alias("stock_code"),
+        col("date_id"),
+        col("Quantity").alias("quantity"),
+        col("UnitPrice").alias("unit_price"),
+        col("TotalAmount").alias("total_amount"),
+        current_timestamp().alias("created_date"),
     )
 
     # Save gold tables
-    sales_summary.write.mode("overwrite").parquet(f"{gold_path}/sales_summary")
-    customer_metrics.write.mode("overwrite").parquet(f"{gold_path}/customer_metrics")
+    dim_customer.write.mode("overwrite").parquet(f"{gold_path}/dim_customer")
+    dim_product.write.mode("overwrite").parquet(f"{gold_path}/dim_product")
+    date_df.write.mode("overwrite").parquet(f"{gold_path}/dim_date")
+    dim_invoice.write.mode("overwrite").parquet(f"{gold_path}/dim_invoice")
+    fact_sales.write.mode("overwrite").parquet(f"{gold_path}/fact_sales")
+
     print("Gold layer created successfully")
 
-    return cleaned_df, sales_summary, customer_metrics
+    return {
+        "silver": cleaned_df,
+        "dim_customer": dim_customer,
+        "dim_product": dim_product,
+        "dim_date": date_df,
+        "dim_invoice": dim_invoice,
+        "fact_sales": fact_sales,
+    }
 
 
 def create_views_and_exports(spark, sales_df, customer_df, export_path="/exports/bi/"):
@@ -160,20 +228,39 @@ def main():
 
         # Execute pipeline
         print("Starting data pipeline...")
-        # clear_table(spark)
 
-        # Ingest data
+        # Ingest raw data to bronze layer
         ingest_data(spark, bronze_path=BRONZE_PATH)
 
-        # Process data
-        cleaned_df, sales_summary_table_view, customer_metrics_table_view = (
-            process_data(spark, BRONZE_PATH, SILVER_PATH, GOLD_PATH)
-        )
+        # Process data to silver layer and gold layer
+        result_dfs = process_data(spark, BRONZE_PATH, SILVER_PATH, GOLD_PATH)
 
-        # Create views and exports
-        # create_views_and_exports(
-        #     spark, sales_summary_table_view, customer_metrics_table_view
-        # )
+        # Print sample of each DataFrame
+        print("\n=== Silver Layer Sample ===")
+        result_dfs["silver"].show(1, truncate=False)
+
+        print("\n=== Dimension Tables Samples ===")
+        print("Customer Dimension:")
+        result_dfs["dim_customer"].show(1, truncate=False)
+
+        print("\nProduct Dimension:")
+        result_dfs["dim_product"].show(1, truncate=False)
+
+        print("\nDate Dimension:")
+        result_dfs["dim_date"].show(1, truncate=False)
+
+        print("\nInvoice Dimension:")
+        result_dfs["dim_invoice"].show(1, truncate=False)
+
+        print("\n=== Fact Table Sample ===")
+        result_dfs["fact_sales"].show(1, truncate=False)
+
+        print("\n=== Data Quality Summary ===")
+        for name, df in result_dfs.items():
+            print(f"\n{name} DataFrame:")
+            print(f"Number of records: {df.count()}")
+            # print("Schema:")
+            # df.printSchema()
 
         print("Pipeline completed successfully!")
 
